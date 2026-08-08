@@ -80,12 +80,17 @@ function client() {
 function inferMimeFromPathOrUrl(source: string): string | undefined {
   const lower = source.split("?")[0]?.toLowerCase() ?? "";
   if (lower.endsWith(".mp4")) return EUploadMimeType.Mp4;
-  if (lower.endsWith(".mov")) return EUploadMimeType.Mov;
+  if (lower.endsWith(".mov") || lower.endsWith(".qt")) return EUploadMimeType.Mov;
   if (lower.endsWith(".webm")) return "video/webm";
   if (lower.endsWith(".gif")) return EUploadMimeType.Gif;
   if (lower.endsWith(".png")) return EUploadMimeType.Png;
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return EUploadMimeType.Jpeg;
   if (lower.endsWith(".webp")) return EUploadMimeType.Webp;
+  if (lower.endsWith(".mp3")) return "audio/mpeg";
+  if (lower.endsWith(".m4a")) return "audio/mp4";
+  if (lower.endsWith(".wav")) return "audio/wav";
+  if (lower.endsWith(".aac")) return "audio/aac";
+  if (lower.endsWith(".ogg") || lower.endsWith(".oga")) return "audio/ogg";
   return undefined;
 }
 
@@ -94,6 +99,169 @@ function normalizeMimeType(mime: string): string {
   // Common aliases
   if (cleaned === "image/jpg") return EUploadMimeType.Jpeg;
   return cleaned;
+}
+
+/** Content-Types too generic to trust over path extension / magic bytes. */
+function isGenericContentType(mime: string | undefined): boolean {
+  if (!mime) return true;
+  const m = normalizeMimeType(mime);
+  return (
+    m === "application/octet-stream" ||
+    m === "binary/octet-stream" ||
+    m === "application/binary" ||
+    m === "application/force-download" ||
+    m === "application/x-download"
+  );
+}
+
+/**
+ * Sniff container type from magic bytes (more reliable than Azure blob Content-Type).
+ */
+function detectFormatFromMagic(buffer: Buffer): {
+  kind: "video" | "image" | "audio" | "unknown";
+  mime?: string;
+  label: string;
+} {
+  if (buffer.length < 12) {
+    return { kind: "unknown", label: "unknown (file too small)" };
+  }
+
+  // ID3 tag (MP3) or raw MPEG frame sync
+  if (
+    buffer.subarray(0, 3).toString("ascii") === "ID3" ||
+    (buffer[0] === 0xff && (buffer[1]! & 0xe0) === 0xe0)
+  ) {
+    return { kind: "audio", mime: "audio/mpeg", label: "MP3 audio" };
+  }
+
+  // RIFF....WAVE
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WAVE"
+  ) {
+    return { kind: "audio", mime: "audio/wav", label: "WAV audio" };
+  }
+
+  // RIFF....AVI / WEBP handled below via RIFF
+  if (
+    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
+    buffer.subarray(8, 12).toString("ascii") === "WEBP"
+  ) {
+    return { kind: "image", mime: EUploadMimeType.Webp, label: "WebP image" };
+  }
+
+  // Ogg
+  if (buffer.subarray(0, 4).toString("ascii") === "OggS") {
+    return { kind: "audio", mime: "audio/ogg", label: "Ogg audio" };
+  }
+
+  // ftyp box (MP4/MOV/M4A) — brand indicates video vs audio-ish
+  if (buffer.subarray(4, 8).toString("ascii") === "ftyp") {
+    const brand = buffer.subarray(8, 12).toString("ascii").replace(/\0/g, "");
+    const audioBrands = new Set(["M4A ", "M4B ", "mp41", "mp42"]); // mp4* can be either; M4A is audio
+    if (brand === "M4A " || brand === "M4B ") {
+      return { kind: "audio", mime: "audio/mp4", label: `M4A audio (brand ${brand})` };
+    }
+    // Most other ftyp brands used for tweetable video
+    if (
+      brand.startsWith("isom") ||
+      brand.startsWith("iso") ||
+      brand.startsWith("mp4") ||
+      brand === "avc1" ||
+      brand === "qt  " ||
+      brand.includes("mp4")
+    ) {
+      return { kind: "video", mime: EUploadMimeType.Mp4, label: `MP4/MOV video (brand ${brand})` };
+    }
+    // Unknown ftyp — treat as video-capable container unless M4A already handled
+    if (!audioBrands.has(brand)) {
+      return { kind: "video", mime: EUploadMimeType.Mp4, label: `ISO-BMFF media (brand ${brand})` };
+    }
+  }
+
+  // PNG / JPEG / GIF
+  if (
+    buffer[0] === 0x89 &&
+    buffer.subarray(1, 4).toString("ascii") === "PNG"
+  ) {
+    return { kind: "image", mime: EUploadMimeType.Png, label: "PNG image" };
+  }
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { kind: "image", mime: EUploadMimeType.Jpeg, label: "JPEG image" };
+  }
+  if (buffer.subarray(0, 6).toString("ascii") === "GIF87a" ||
+      buffer.subarray(0, 6).toString("ascii") === "GIF89a") {
+    return { kind: "image", mime: EUploadMimeType.Gif, label: "GIF image" };
+  }
+
+  // WebM / Matroska
+  if (
+    buffer[0] === 0x1a &&
+    buffer[1] === 0x45 &&
+    buffer[2] === 0xdf &&
+    buffer[3] === 0xa3
+  ) {
+    return { kind: "video", mime: "video/webm", label: "WebM/Matroska video" };
+  }
+
+  return { kind: "unknown", label: "unknown binary" };
+}
+
+/**
+ * Reject payloads that cannot succeed as tweet media (e.g. MP3 labeled as video/mp4).
+ */
+function assertMediaCompatible(params: {
+  buffer: Buffer;
+  mediaType: string;
+  mediaCategory: MediaCategory;
+  sourceHint?: string;
+}): void {
+  const detected = detectFormatFromMagic(params.buffer);
+  const wantsVideo =
+    params.mediaCategory === "tweet_video" ||
+    params.mediaCategory === "amplify_video" ||
+    params.mediaCategory === "dm_video" ||
+    params.mediaType.startsWith("video/");
+  const wantsImage =
+    params.mediaCategory === "tweet_image" ||
+    params.mediaCategory === "dm_image" ||
+    (params.mediaType.startsWith("image/") && !params.mediaType.includes("gif"));
+  const wantsGif =
+    params.mediaCategory === "tweet_gif" ||
+    params.mediaCategory === "dm_gif" ||
+    params.mediaType === "image/gif";
+
+  if (detected.kind === "audio" || params.mediaType.startsWith("audio/")) {
+    throw new Error(
+      `Cannot upload audio as tweet media. Detected ${detected.label}` +
+        (params.sourceHint ? ` from ${params.sourceHint}` : "") +
+        `. X posts only accept images, GIF, or video (H.264 MP4/MOV) — not MP3/M4A/WAV. ` +
+        `Convert the audio to a video file (e.g. waveform or static image + audio in MP4) and re-upload with media_type=video/mp4.`,
+    );
+  }
+
+  if (wantsVideo && detected.kind === "image") {
+    throw new Error(
+      `media_category/media_type request video but file is ${detected.label}. Use tweet_image / image/* instead.`,
+    );
+  }
+
+  if ((wantsImage || wantsGif) && detected.kind === "video") {
+    throw new Error(
+      `media_category/media_type request image/GIF but file is ${detected.label}. Use tweet_video / video/mp4 instead.`,
+    );
+  }
+
+  if (wantsVideo && detected.kind === "unknown") {
+    // Soft warning path: still allow, Twitter will reject if invalid — but flag clearly if extension says audio
+    const hint = params.sourceHint?.toLowerCase() ?? "";
+    if (/\.(mp3|wav|aac|m4a|ogg|oga)(\?|$)/.test(hint)) {
+      throw new Error(
+        `URL/path looks like audio (${params.sourceHint}) but media_type=${params.mediaType}. ` +
+          `X does not accept bare audio as tweet_video.`,
+      );
+    }
+  }
 }
 
 function inferMediaCategory(mimeType: string): MediaCategory {
@@ -185,9 +353,12 @@ async function loadMediaBuffer(source: MediaSource): Promise<{
   }
 
   const headerMime = response.headers.get("content-type") ?? undefined;
-  const inferredMime =
-    (headerMime ? normalizeMimeType(headerMime) : undefined) ||
-    inferMimeFromPathOrUrl(source.url);
+  const fromHeader =
+    headerMime && !isGenericContentType(headerMime)
+      ? normalizeMimeType(headerMime)
+      : undefined;
+  // Prefer path extension over generic blob Content-Types (Azure often sends application/octet-stream).
+  const inferredMime = fromHeader || inferMimeFromPathOrUrl(source.url);
 
   return { buffer, inferredMime };
 }
@@ -377,27 +548,69 @@ export async function uploadMedia(params: {
     );
   }
 
-  const mediaType = normalizeMimeType(params.mediaType ?? inferredMime ?? "");
+  const detected = detectFormatFromMagic(buffer);
+  const mediaType = normalizeMimeType(
+    params.mediaType ?? inferredMime ?? detected.mime ?? "",
+  );
   if (!mediaType) {
     throw new Error(
       "Could not determine media_type. Pass media_type explicitly (e.g. video/mp4).",
     );
   }
 
-  const mediaCategory = params.mediaCategory ?? inferMediaCategory(mediaType);
+  if (mediaType.startsWith("audio/")) {
+    throw new Error(
+      `Cannot upload audio (${mediaType}). X posts only accept images, GIF, or video — not bare audio. ` +
+        `Mux the audio into an MP4 video and upload with media_type=video/mp4.`,
+    );
+  }
+
+  let mediaCategory: MediaCategory;
+  try {
+    mediaCategory = params.mediaCategory ?? inferMediaCategory(mediaType);
+  } catch (error) {
+    throw error instanceof Error ? error : new Error(String(error));
+  }
+
+  const sourceHint =
+    params.source.kind === "url"
+      ? params.source.url.split("?")[0]
+      : params.source.kind === "path"
+        ? params.source.path
+        : undefined;
+
+  assertMediaCompatible({
+    buffer,
+    mediaType,
+    mediaCategory,
+    sourceHint,
+  });
 
   return withTwitterError(async () => {
-    const mediaId = await client().v2.uploadMedia(buffer, {
-      media_type: mediaType as `${EUploadMimeType}`,
-      media_category: mediaCategory,
-    });
+    try {
+      const mediaId = await client().v2.uploadMedia(buffer, {
+        media_type: mediaType as `${EUploadMimeType}`,
+        media_category: mediaCategory,
+      });
 
-    return {
-      media_id: mediaId,
-      media_type: mediaType,
-      media_category: mediaCategory,
-      bytes: buffer.length,
-    };
+      return {
+        media_id: mediaId,
+        media_type: mediaType,
+        media_category: mediaCategory,
+        bytes: buffer.length,
+      };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      // Library often surfaces "Media processing failed: undefined" with no detail.
+      if (msg.includes("Media processing failed")) {
+        throw new Error(
+          `${msg}. X rejected the file during async processing. ` +
+            `For video use H.264 MP4/MOV (not MP3/audio), duration 0.5–140s, max 512MB. ` +
+            `Detected local format: ${detected.label}.`,
+        );
+      }
+      throw error;
+    }
   });
 }
 
