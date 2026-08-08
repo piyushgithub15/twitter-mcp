@@ -357,20 +357,36 @@ export async function uploadMedia(params: {
   media_category: MediaCategory;
   bytes: number;
 }> {
-  return withTwitterError(async () => {
-    const { buffer, inferredMime } = await loadMediaBuffer(params.source);
-    const mediaType = normalizeMimeType(
-      params.mediaType ?? inferredMime ?? "",
-    );
-    if (!mediaType) {
-      throw new Error(
-        "Could not determine media_type. Pass media_type explicitly (e.g. video/mp4).",
-      );
+  // Fail fast on missing token before downloading large media.
+  getAccessToken();
+
+  let buffer: Buffer;
+  let inferredMime: string | undefined;
+  try {
+    ({ buffer, inferredMime } = await loadMediaBuffer(params.source));
+  } catch (error) {
+    // Do not label download/IO failures as Twitter API errors (misleading for agents).
+    if (
+      error instanceof Error &&
+      error.message.startsWith("Missing access token")
+    ) {
+      throw error;
     }
+    throw new Error(
+      `Media load failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
-    const mediaCategory =
-      params.mediaCategory ?? inferMediaCategory(mediaType);
+  const mediaType = normalizeMimeType(params.mediaType ?? inferredMime ?? "");
+  if (!mediaType) {
+    throw new Error(
+      "Could not determine media_type. Pass media_type explicitly (e.g. video/mp4).",
+    );
+  }
 
+  const mediaCategory = params.mediaCategory ?? inferMediaCategory(mediaType);
+
+  return withTwitterError(async () => {
     const mediaId = await client().v2.uploadMedia(buffer, {
       media_type: mediaType as `${EUploadMimeType}`,
       media_category: mediaCategory,
