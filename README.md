@@ -45,8 +45,10 @@ Missing access token. Tool calls require an OAuth user access token via the `acc
 Suggested OAuth 2.0 scopes for full tool coverage:
 
 ```
-tweet.read tweet.write users.read follows.read follows.write offline.access
+tweet.read tweet.write users.read follows.read follows.write media.write offline.access
 ```
+
+> **Media / video posting** requires `media.write` in addition to `tweet.write`. Re-authorize users after adding the scope so tokens include it.
 
 ## Tools
 
@@ -59,11 +61,24 @@ tweet.read tweet.write users.read follows.read follows.write offline.access
 | `get_user_timeline` | User's recent posts |
 | `get_user_mentions` | Mentions timeline |
 | `search_recent_tweets` | Recent search (last 7 days) |
-| `post_tweet` | Create a post (optional reply / quote) |
+| `upload_media` | Upload image / GIF / video (returns `media_id`) |
+| `post_tweet` | Create a post (optional reply / quote / media) |
 | `delete_tweet` | Delete own post |
 | `like_tweet` / `unlike_tweet` | Like management |
 | `retweet` / `undo_retweet` | Retweet management |
 | `follow_user` / `unfollow_user` | Follow management |
+
+### Posting video
+
+1. Call **`upload_media`** with one of:
+   - `media_url` — HTTP(S) URL (preferred for large files)
+   - `media_path` — path on the server host
+   - `media_base64` — base64 payload (JSON body limit 64 MB; prefer URL for big videos)
+2. Optionally set `media_type` to `video/mp4` or `video/quicktime` if it cannot be inferred.
+3. Wait for the tool to return `{ "media_id": "..." }` (videos are processed server-side before return).
+4. Call **`post_tweet`** with `media_ids: ["<media_id>"]` and optional `text`.
+
+Limits: **1 video or 1 GIF**, or **up to 4 images** per post. Max file size loaded in-process: **512 MB**.
 
 ## Local development
 

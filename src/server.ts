@@ -233,17 +233,113 @@ export function createTwitterMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "upload_media",
+    {
+      title: "Upload media",
+      description:
+        "Upload an image, GIF, or video to X/Twitter (chunked API v2). Returns a media_id to pass to post_tweet. " +
+        "Videos (mp4/mov) are fully processed before the media_id is returned. " +
+        "Provide exactly one of media_url, media_path, or media_base64. " +
+        "Requires OAuth scopes: media.write (and tweet.write to post).",
+      inputSchema: {
+        media_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("HTTP(S) URL of the media file to download and upload"),
+        media_path: z
+          .string()
+          .min(1)
+          .optional()
+          .describe("Local filesystem path on the MCP server host"),
+        media_base64: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Base64-encoded media (raw or data: URL). Prefer media_url for large videos.",
+          ),
+        media_type: z
+          .enum([
+            "video/mp4",
+            "video/quicktime",
+            "video/webm",
+            "image/jpeg",
+            "image/png",
+            "image/gif",
+            "image/webp",
+          ])
+          .optional()
+          .describe(
+            "MIME type. Inferred from path/URL/Content-Type when omitted; required for bare base64.",
+          ),
+        media_category: z
+          .enum([
+            "tweet_video",
+            "tweet_image",
+            "tweet_gif",
+            "amplify_video",
+            "dm_video",
+            "dm_image",
+            "dm_gif",
+            "subtitles",
+          ])
+          .optional()
+          .describe(
+            "X media category. Defaults from media_type (tweet_video for videos).",
+          ),
+      },
+    },
+    async (args) => {
+      try {
+        const sources = [
+          args.media_url ? 1 : 0,
+          args.media_path ? 1 : 0,
+          args.media_base64 ? 1 : 0,
+        ].reduce((a, b) => a + b, 0);
+        if (sources !== 1) {
+          throw new Error(
+            "Provide exactly one of media_url, media_path, or media_base64",
+          );
+        }
+
+        let source: twitter.MediaSource;
+        if (args.media_url) {
+          source = { kind: "url", url: args.media_url };
+        } else if (args.media_path) {
+          source = { kind: "path", path: args.media_path };
+        } else {
+          source = { kind: "base64", data: args.media_base64! };
+        }
+
+        const result = await twitter.uploadMedia({
+          source,
+          mediaType: args.media_type,
+          mediaCategory: args.media_category,
+        });
+        return textResult(result);
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
+  server.registerTool(
     "post_tweet",
     {
       title: "Post tweet",
       description:
-        "Create a new tweet/post as the authenticated user. Requires tweet.write scope.",
+        "Create a new tweet/post as the authenticated user. " +
+        "Supports text, optional reply/quote, and media (images/video) via media_ids from upload_media. " +
+        "Attach 1 video or GIF, or up to 4 images. Requires tweet.write; media needs prior upload_media (media.write).",
       inputSchema: {
         text: z
           .string()
-          .min(1)
           .max(280)
-          .describe("Tweet text (max 280 characters for standard posts)"),
+          .optional()
+          .describe(
+            "Tweet text (max 280 characters). Optional if media_ids is provided.",
+          ),
         reply_to_tweet_id: z
           .string()
           .optional()
@@ -252,6 +348,14 @@ export function createTwitterMcpServer(): McpServer {
           .string()
           .optional()
           .describe("If set, quote this tweet ID"),
+        media_ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(4)
+          .optional()
+          .describe(
+            "Media IDs from upload_media. Max 4 images, or 1 video, or 1 GIF.",
+          ),
       },
     },
     async (args) => {
@@ -260,6 +364,7 @@ export function createTwitterMcpServer(): McpServer {
           text: args.text,
           replyToTweetId: args.reply_to_tweet_id,
           quoteTweetId: args.quote_tweet_id,
+          mediaIds: args.media_ids,
         });
         return textResult(result);
       } catch (error) {

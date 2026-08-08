@@ -1,5 +1,22 @@
-import { TwitterApi, type TweetV2PostTweetResult, type UserV2 } from "twitter-api-v2";
+import { readFile } from "node:fs/promises";
+import {
+  TwitterApi,
+  EUploadMimeType,
+  type TweetV2PostTweetResult,
+  type UserV2,
+} from "twitter-api-v2";
 import { getAccessToken } from "./auth.js";
+
+/** Mirrors twitter-api-v2 MediaV2MediaCategory (not re-exported from package root). */
+export type MediaCategory =
+  | "tweet_image"
+  | "tweet_video"
+  | "tweet_gif"
+  | "dm_image"
+  | "dm_video"
+  | "dm_gif"
+  | "subtitles"
+  | "amplify_video";
 
 const DEFAULT_USER_FIELDS = [
   "id",
@@ -29,8 +46,150 @@ const DEFAULT_TWEET_FIELDS = [
   "entities",
 ] as const;
 
+/** Max bytes we will load into memory for a single media upload (512 MB). */
+const MAX_MEDIA_BYTES = 512 * 1024 * 1024;
+
+const VIDEO_MIME_TYPES = new Set([
+  EUploadMimeType.Mp4,
+  EUploadMimeType.Mov,
+  "video/mp4",
+  "video/quicktime",
+  "video/webm",
+]);
+
+const IMAGE_MIME_TYPES = new Set([
+  EUploadMimeType.Jpeg,
+  EUploadMimeType.Png,
+  EUploadMimeType.Gif,
+  EUploadMimeType.Webp,
+  "image/jpeg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+]);
+
+export type MediaSource =
+  | { kind: "url"; url: string }
+  | { kind: "path"; path: string }
+  | { kind: "base64"; data: string };
+
 function client() {
   return new TwitterApi(getAccessToken());
+}
+
+function inferMimeFromPathOrUrl(source: string): string | undefined {
+  const lower = source.split("?")[0]?.toLowerCase() ?? "";
+  if (lower.endsWith(".mp4")) return EUploadMimeType.Mp4;
+  if (lower.endsWith(".mov")) return EUploadMimeType.Mov;
+  if (lower.endsWith(".webm")) return "video/webm";
+  if (lower.endsWith(".gif")) return EUploadMimeType.Gif;
+  if (lower.endsWith(".png")) return EUploadMimeType.Png;
+  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return EUploadMimeType.Jpeg;
+  if (lower.endsWith(".webp")) return EUploadMimeType.Webp;
+  return undefined;
+}
+
+function normalizeMimeType(mime: string): string {
+  const cleaned = mime.trim().toLowerCase().split(";")[0]?.trim() ?? mime;
+  // Common aliases
+  if (cleaned === "image/jpg") return EUploadMimeType.Jpeg;
+  return cleaned;
+}
+
+function inferMediaCategory(mimeType: string): MediaCategory {
+  if (mimeType.includes("gif")) return "tweet_gif";
+  if (VIDEO_MIME_TYPES.has(mimeType) || mimeType.startsWith("video/")) {
+    return "tweet_video";
+  }
+  if (IMAGE_MIME_TYPES.has(mimeType) || mimeType.startsWith("image/")) {
+    return "tweet_image";
+  }
+  throw new Error(
+    `Unsupported media_type "${mimeType}". Use video/mp4, video/quicktime, image/jpeg, image/png, image/gif, or image/webp.`,
+  );
+}
+
+function stripDataUrlPrefix(base64: string): string {
+  const match = /^data:[^;]+;base64,(.+)$/s.exec(base64);
+  return match?.[1] ?? base64;
+}
+
+async function loadMediaBuffer(source: MediaSource): Promise<{
+  buffer: Buffer;
+  inferredMime?: string;
+}> {
+  if (source.kind === "base64") {
+    const raw = stripDataUrlPrefix(source.data).replace(/\s/g, "");
+    const buffer = Buffer.from(raw, "base64");
+    if (buffer.length === 0) {
+      throw new Error("media_base64 decoded to empty buffer");
+    }
+    if (buffer.length > MAX_MEDIA_BYTES) {
+      throw new Error(
+        `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
+      );
+    }
+    return { buffer };
+  }
+
+  if (source.kind === "path") {
+    const buffer = await readFile(source.path);
+    if (buffer.length > MAX_MEDIA_BYTES) {
+      throw new Error(
+        `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
+      );
+    }
+    return {
+      buffer,
+      inferredMime: inferMimeFromPathOrUrl(source.path),
+    };
+  }
+
+  // URL download
+  let parsed: URL;
+  try {
+    parsed = new URL(source.url);
+  } catch {
+    throw new Error(`Invalid media_url: ${source.url}`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("media_url must be an http(s) URL");
+  }
+
+  const response = await fetch(source.url, {
+    redirect: "follow",
+    headers: { Accept: "*/*" },
+  });
+  if (!response.ok) {
+    throw new Error(
+      `Failed to download media_url (HTTP ${response.status} ${response.statusText})`,
+    );
+  }
+
+  const contentLength = Number(response.headers.get("content-length") ?? 0);
+  if (contentLength > MAX_MEDIA_BYTES) {
+    throw new Error(
+      `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (Content-Length ${contentLength})`,
+    );
+  }
+
+  const arrayBuffer = await response.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+  if (buffer.length === 0) {
+    throw new Error("media_url downloaded empty body");
+  }
+  if (buffer.length > MAX_MEDIA_BYTES) {
+    throw new Error(
+      `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
+    );
+  }
+
+  const headerMime = response.headers.get("content-type") ?? undefined;
+  const inferredMime =
+    (headerMime ? normalizeMimeType(headerMime) : undefined) ||
+    inferMimeFromPathOrUrl(source.url);
+
+  return { buffer, inferredMime };
 }
 
 function formatError(error: unknown): string {
@@ -182,23 +341,103 @@ export async function searchRecentTweets(params: {
   });
 }
 
+/**
+ * Upload media (image, GIF, or video) via X API v2 chunked upload.
+ * Requires OAuth 2.0 scope `media.write`. Videos are processed before returning.
+ */
+export async function uploadMedia(params: {
+  source: MediaSource;
+  /** MIME type; inferred from path/URL/Content-Type when omitted */
+  mediaType?: string;
+  /** Defaults from media type (tweet_video / tweet_image / tweet_gif) */
+  mediaCategory?: MediaCategory;
+}): Promise<{
+  media_id: string;
+  media_type: string;
+  media_category: MediaCategory;
+  bytes: number;
+}> {
+  return withTwitterError(async () => {
+    const { buffer, inferredMime } = await loadMediaBuffer(params.source);
+    const mediaType = normalizeMimeType(
+      params.mediaType ?? inferredMime ?? "",
+    );
+    if (!mediaType) {
+      throw new Error(
+        "Could not determine media_type. Pass media_type explicitly (e.g. video/mp4).",
+      );
+    }
+
+    const mediaCategory =
+      params.mediaCategory ?? inferMediaCategory(mediaType);
+
+    const mediaId = await client().v2.uploadMedia(buffer, {
+      media_type: mediaType as `${EUploadMimeType}`,
+      media_category: mediaCategory,
+    });
+
+    return {
+      media_id: mediaId,
+      media_type: mediaType,
+      media_category: mediaCategory,
+      bytes: buffer.length,
+    };
+  });
+}
+
 export async function postTweet(params: {
-  text: string;
+  /** Tweet text; optional when media_ids is provided */
+  text?: string;
   replyToTweetId?: string;
   quoteTweetId?: string;
+  /** Up to 4 image media IDs, or 1 video / 1 GIF media ID from upload_media */
+  mediaIds?: string[];
 }): Promise<TweetV2PostTweetResult> {
   return withTwitterError(async () => {
+    const text = params.text?.trim() ?? "";
+    const mediaIds = params.mediaIds?.filter(Boolean) ?? [];
+
+    if (!text && mediaIds.length === 0) {
+      throw new Error("post_tweet requires text and/or media_ids");
+    }
+    if (mediaIds.length > 4) {
+      throw new Error("A tweet can attach at most 4 media items (1 for video/GIF)");
+    }
+
     const payload: {
-      text: string;
+      text?: string;
       reply?: { in_reply_to_tweet_id: string };
       quote_tweet_id?: string;
-    } = { text: params.text };
+      media?: {
+        media_ids:
+          | [string]
+          | [string, string]
+          | [string, string, string]
+          | [string, string, string, string];
+      };
+    } = {};
 
+    if (text) {
+      payload.text = text;
+    }
     if (params.replyToTweetId) {
       payload.reply = { in_reply_to_tweet_id: params.replyToTweetId };
     }
     if (params.quoteTweetId) {
       payload.quote_tweet_id = params.quoteTweetId;
+    }
+    if (mediaIds.length === 1) {
+      payload.media = { media_ids: [mediaIds[0]!] };
+    } else if (mediaIds.length === 2) {
+      payload.media = { media_ids: [mediaIds[0]!, mediaIds[1]!] };
+    } else if (mediaIds.length === 3) {
+      payload.media = {
+        media_ids: [mediaIds[0]!, mediaIds[1]!, mediaIds[2]!],
+      };
+    } else if (mediaIds.length === 4) {
+      payload.media = {
+        media_ids: [mediaIds[0]!, mediaIds[1]!, mediaIds[2]!, mediaIds[3]!],
+      };
     }
 
     return client().v2.tweet(payload);
