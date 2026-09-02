@@ -1,4 +1,3 @@
-import { readFile } from "node:fs/promises";
 import {
   TwitterApi,
   EUploadMimeType,
@@ -7,16 +6,8 @@ import {
 } from "twitter-api-v2";
 import { getAccessToken } from "./auth.js";
 
-/** Mirrors twitter-api-v2 MediaV2MediaCategory (not re-exported from package root). */
-export type MediaCategory =
-  | "tweet_image"
-  | "tweet_video"
-  | "tweet_gif"
-  | "dm_image"
-  | "dm_video"
-  | "dm_gif"
-  | "subtitles"
-  | "amplify_video";
+/** Post media categories only — this MCP does not upload DM/ads/subtitle assets. */
+export type MediaCategory = "tweet_image" | "tweet_video" | "tweet_gif";
 
 const DEFAULT_USER_FIELDS = [
   "id",
@@ -46,285 +37,193 @@ const DEFAULT_TWEET_FIELDS = [
   "entities",
 ] as const;
 
-/** Max bytes we will load into memory for a single media upload (512 MB). */
-const MAX_MEDIA_BYTES = 512 * 1024 * 1024;
+/** X image / GIF caps. Video is capped in-process (X allows 8–16 GB). */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MAX_GIF_BYTES = 15 * 1024 * 1024;
+const MAX_VIDEO_BYTES = 512 * 1024 * 1024;
 
-const VIDEO_MIME_TYPES = new Set([
-  EUploadMimeType.Mp4,
-  EUploadMimeType.Mov,
-  "video/mp4",
-  "video/quicktime",
-  "video/webm",
-]);
+const SUPPORTED =
+  "JPEG/PNG/WEBP (≤5 MB), GIF (≤15 MB), or H.264 MP4/MOV video";
 
-const IMAGE_MIME_TYPES = new Set([
+const SUPPORTED_MIME = new Set<string>([
   EUploadMimeType.Jpeg,
   EUploadMimeType.Png,
   EUploadMimeType.Gif,
   EUploadMimeType.Webp,
-  "image/jpeg",
-  "image/png",
-  "image/gif",
-  "image/webp",
+  EUploadMimeType.Mp4,
+  EUploadMimeType.Mov,
 ]);
 
-export type MediaSource =
-  | { kind: "url"; url: string }
-  | { kind: "path"; path: string }
-  | { kind: "base64"; data: string };
+const EXT_MIME: Record<string, string> = {
+  jpg: EUploadMimeType.Jpeg,
+  jpeg: EUploadMimeType.Jpeg,
+  png: EUploadMimeType.Png,
+  gif: EUploadMimeType.Gif,
+  webp: EUploadMimeType.Webp,
+  mp4: EUploadMimeType.Mp4,
+  mov: EUploadMimeType.Mov,
+  qt: EUploadMimeType.Mov,
+};
 
 function client() {
   return new TwitterApi(getAccessToken());
 }
 
-function inferMimeFromPathOrUrl(source: string): string | undefined {
-  const lower = source.split("?")[0]?.toLowerCase() ?? "";
-  if (lower.endsWith(".mp4")) return EUploadMimeType.Mp4;
-  if (lower.endsWith(".mov") || lower.endsWith(".qt")) return EUploadMimeType.Mov;
-  if (lower.endsWith(".webm")) return "video/webm";
-  if (lower.endsWith(".gif")) return EUploadMimeType.Gif;
-  if (lower.endsWith(".png")) return EUploadMimeType.Png;
-  if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return EUploadMimeType.Jpeg;
-  if (lower.endsWith(".webp")) return EUploadMimeType.Webp;
-  if (lower.endsWith(".mp3")) return "audio/mpeg";
-  if (lower.endsWith(".m4a")) return "audio/mp4";
-  if (lower.endsWith(".wav")) return "audio/wav";
-  if (lower.endsWith(".aac")) return "audio/aac";
-  if (lower.endsWith(".ogg") || lower.endsWith(".oga")) return "audio/ogg";
-  return undefined;
+function ascii(buffer: Buffer, start: number, end: number): string {
+  return buffer.subarray(start, end).toString("ascii");
 }
 
-function normalizeMimeType(mime: string): string {
-  const cleaned = mime.trim().toLowerCase().split(";")[0]?.trim() ?? mime;
-  // Common aliases
-  if (cleaned === "image/jpg") return EUploadMimeType.Jpeg;
-  return cleaned;
-}
+function detectMedia(
+  buffer: Buffer,
+):
+  | { kind: "image" | "video"; mime: string }
+  | { kind: "audio"; label: string }
+  | { kind: "unsupported"; label: string }
+  | { kind: "unknown" } {
+  if (buffer.length < 12) return { kind: "unknown" };
 
-/** Content-Types too generic to trust over path extension / magic bytes. */
-function isGenericContentType(mime: string | undefined): boolean {
-  if (!mime) return true;
-  const m = normalizeMimeType(mime);
-  return (
-    m === "application/octet-stream" ||
-    m === "binary/octet-stream" ||
-    m === "application/binary" ||
-    m === "application/force-download" ||
-    m === "application/x-download"
-  );
-}
-
-/**
- * Sniff container type from magic bytes (more reliable than Azure blob Content-Type).
- */
-function detectFormatFromMagic(buffer: Buffer): {
-  kind: "video" | "image" | "audio" | "unknown";
-  mime?: string;
-  label: string;
-} {
-  if (buffer.length < 12) {
-    return { kind: "unknown", label: "unknown (file too small)" };
-  }
-
-  // ID3 tag (MP3) or raw MPEG frame sync
-  if (
-    buffer.subarray(0, 3).toString("ascii") === "ID3" ||
-    (buffer[0] === 0xff && (buffer[1]! & 0xe0) === 0xe0)
-  ) {
-    return { kind: "audio", mime: "audio/mpeg", label: "MP3 audio" };
-  }
-
-  // RIFF....WAVE
-  if (
-    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
-    buffer.subarray(8, 12).toString("ascii") === "WAVE"
-  ) {
-    return { kind: "audio", mime: "audio/wav", label: "WAV audio" };
-  }
-
-  // RIFF....AVI / WEBP handled below via RIFF
-  if (
-    buffer.subarray(0, 4).toString("ascii") === "RIFF" &&
-    buffer.subarray(8, 12).toString("ascii") === "WEBP"
-  ) {
-    return { kind: "image", mime: EUploadMimeType.Webp, label: "WebP image" };
-  }
-
-  // Ogg
-  if (buffer.subarray(0, 4).toString("ascii") === "OggS") {
-    return { kind: "audio", mime: "audio/ogg", label: "Ogg audio" };
-  }
-
-  // ftyp box (MP4/MOV/M4A) — brand indicates video vs audio-ish
-  if (buffer.subarray(4, 8).toString("ascii") === "ftyp") {
-    const brand = buffer.subarray(8, 12).toString("ascii").replace(/\0/g, "");
-    const audioBrands = new Set(["M4A ", "M4B ", "mp41", "mp42"]); // mp4* can be either; M4A is audio
-    if (brand === "M4A " || brand === "M4B ") {
-      return { kind: "audio", mime: "audio/mp4", label: `M4A audio (brand ${brand})` };
-    }
-    // Most other ftyp brands used for tweetable video
-    if (
-      brand.startsWith("isom") ||
-      brand.startsWith("iso") ||
-      brand.startsWith("mp4") ||
-      brand === "avc1" ||
-      brand === "qt  " ||
-      brand.includes("mp4")
-    ) {
-      return { kind: "video", mime: EUploadMimeType.Mp4, label: `MP4/MOV video (brand ${brand})` };
-    }
-    // Unknown ftyp — treat as video-capable container unless M4A already handled
-    if (!audioBrands.has(brand)) {
-      return { kind: "video", mime: EUploadMimeType.Mp4, label: `ISO-BMFF media (brand ${brand})` };
-    }
-  }
-
-  // PNG / JPEG / GIF
-  if (
-    buffer[0] === 0x89 &&
-    buffer.subarray(1, 4).toString("ascii") === "PNG"
-  ) {
-    return { kind: "image", mime: EUploadMimeType.Png, label: "PNG image" };
+  if (buffer[0] === 0x89 && ascii(buffer, 1, 4) === "PNG") {
+    return { kind: "image", mime: EUploadMimeType.Png };
   }
   if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return { kind: "image", mime: EUploadMimeType.Jpeg, label: "JPEG image" };
+    return { kind: "image", mime: EUploadMimeType.Jpeg };
   }
-  if (buffer.subarray(0, 6).toString("ascii") === "GIF87a" ||
-      buffer.subarray(0, 6).toString("ascii") === "GIF89a") {
-    return { kind: "image", mime: EUploadMimeType.Gif, label: "GIF image" };
+  const gif = ascii(buffer, 0, 6);
+  if (gif === "GIF87a" || gif === "GIF89a") {
+    return { kind: "image", mime: EUploadMimeType.Gif };
   }
-
-  // WebM / Matroska
+  if (ascii(buffer, 0, 4) === "RIFF" && ascii(buffer, 8, 12) === "WEBP") {
+    return { kind: "image", mime: EUploadMimeType.Webp };
+  }
+  if (ascii(buffer, 0, 4) === "RIFF" && ascii(buffer, 8, 12) === "WAVE") {
+    return { kind: "audio", label: "WAV" };
+  }
+  if (ascii(buffer, 0, 3) === "ID3") {
+    return { kind: "audio", label: "MP3" };
+  }
+  if (ascii(buffer, 0, 4) === "OggS") {
+    return { kind: "audio", label: "Ogg" };
+  }
+  if (ascii(buffer, 4, 8) === "ftyp") {
+    const brand = ascii(buffer, 8, 12);
+    if (brand === "M4A " || brand === "M4B ") {
+      return { kind: "audio", label: "M4A" };
+    }
+    if (brand === "qt  ") {
+      return { kind: "video", mime: EUploadMimeType.Mov };
+    }
+    return { kind: "video", mime: EUploadMimeType.Mp4 };
+  }
   if (
     buffer[0] === 0x1a &&
     buffer[1] === 0x45 &&
     buffer[2] === 0xdf &&
     buffer[3] === 0xa3
   ) {
-    return { kind: "video", mime: "video/webm", label: "WebM/Matroska video" };
+    return { kind: "unsupported", label: "WebM" };
   }
 
-  return { kind: "unknown", label: "unknown binary" };
+  return { kind: "unknown" };
 }
 
-/**
- * Reject payloads that cannot succeed as tweet media (e.g. MP3 labeled as video/mp4).
- */
-function assertMediaCompatible(params: {
+function cleanMime(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const mime = value.trim().toLowerCase().split(";")[0]?.trim();
+  if (
+    !mime ||
+    mime === "application/octet-stream" ||
+    mime === "binary/octet-stream" ||
+    mime === "application/binary"
+  ) {
+    return undefined;
+  }
+  if (mime === "image/jpg") return EUploadMimeType.Jpeg;
+  return mime;
+}
+
+function mimeFromUrl(url: string): string | undefined {
+  try {
+    const path = new URL(url).pathname.toLowerCase();
+    const ext = path.match(/\.([a-z0-9]+)$/)?.[1];
+    return ext ? EXT_MIME[ext] : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function categoryFor(mime: string): MediaCategory {
+  if (mime === EUploadMimeType.Gif) return "tweet_gif";
+  if (mime.startsWith("video/")) return "tweet_video";
+  return "tweet_image";
+}
+
+function maxBytesFor(category: MediaCategory): number {
+  if (category === "tweet_image") return MAX_IMAGE_BYTES;
+  if (category === "tweet_gif") return MAX_GIF_BYTES;
+  return MAX_VIDEO_BYTES;
+}
+
+function resolveMedia(
+  buffer: Buffer,
+  url: string,
+  contentType?: string,
+): { mediaType: string; mediaCategory: MediaCategory } {
+  const detected = detectMedia(buffer);
+
+  if (detected.kind === "audio") {
+    throw new Error(
+      `X does not accept audio files (${detected.label}). ${SUPPORTED}. Mux audio into an MP4 (H.264 + AAC) first.`,
+    );
+  }
+  if (detected.kind === "unsupported") {
+    throw new Error(
+      `${detected.label} is not a reliable post format. Convert to H.264 MP4/MOV. ${SUPPORTED}.`,
+    );
+  }
+
+  const mime =
+    detected.kind === "unknown"
+      ? (cleanMime(contentType) ?? mimeFromUrl(url))
+      : detected.mime;
+
+  if (mime === "video/webm" || mime === "video/mp2t") {
+    throw new Error(
+      `${mime} is not a reliable post format. Convert to H.264 MP4/MOV. ${SUPPORTED}.`,
+    );
+  }
+
+  if (!mime || !SUPPORTED_MIME.has(mime)) {
+    throw new Error(
+      `Unsupported media${mime ? ` (${mime})` : ""} from ${url}. ${SUPPORTED}.`,
+    );
+  }
+
+  const mediaCategory = categoryFor(mime);
+  const max = maxBytesFor(mediaCategory);
+  if (buffer.length > max) {
+    throw new Error(
+      `File is ${buffer.length} bytes; ${mediaCategory} max is ${max} bytes. ${SUPPORTED}.`,
+    );
+  }
+
+  return { mediaType: mime, mediaCategory };
+}
+
+async function downloadMedia(url: string): Promise<{
   buffer: Buffer;
-  mediaType: string;
-  mediaCategory: MediaCategory;
-  sourceHint?: string;
-}): void {
-  const detected = detectFormatFromMagic(params.buffer);
-  const wantsVideo =
-    params.mediaCategory === "tweet_video" ||
-    params.mediaCategory === "amplify_video" ||
-    params.mediaCategory === "dm_video" ||
-    params.mediaType.startsWith("video/");
-  const wantsImage =
-    params.mediaCategory === "tweet_image" ||
-    params.mediaCategory === "dm_image" ||
-    (params.mediaType.startsWith("image/") && !params.mediaType.includes("gif"));
-  const wantsGif =
-    params.mediaCategory === "tweet_gif" ||
-    params.mediaCategory === "dm_gif" ||
-    params.mediaType === "image/gif";
-
-  if (detected.kind === "audio" || params.mediaType.startsWith("audio/")) {
-    throw new Error(
-      `Cannot upload audio as tweet media. Detected ${detected.label}` +
-        (params.sourceHint ? ` from ${params.sourceHint}` : "") +
-        `. X posts only accept images, GIF, or video (H.264 MP4/MOV) — not MP3/M4A/WAV. ` +
-        `Convert the audio to a video file (e.g. waveform or static image + audio in MP4) and re-upload with media_type=video/mp4.`,
-    );
-  }
-
-  if (wantsVideo && detected.kind === "image") {
-    throw new Error(
-      `media_category/media_type request video but file is ${detected.label}. Use tweet_image / image/* instead.`,
-    );
-  }
-
-  if ((wantsImage || wantsGif) && detected.kind === "video") {
-    throw new Error(
-      `media_category/media_type request image/GIF but file is ${detected.label}. Use tweet_video / video/mp4 instead.`,
-    );
-  }
-
-  if (wantsVideo && detected.kind === "unknown") {
-    // Soft warning path: still allow, Twitter will reject if invalid — but flag clearly if extension says audio
-    const hint = params.sourceHint?.toLowerCase() ?? "";
-    if (/\.(mp3|wav|aac|m4a|ogg|oga)(\?|$)/.test(hint)) {
-      throw new Error(
-        `URL/path looks like audio (${params.sourceHint}) but media_type=${params.mediaType}. ` +
-          `X does not accept bare audio as tweet_video.`,
-      );
-    }
-  }
-}
-
-function inferMediaCategory(mimeType: string): MediaCategory {
-  if (mimeType.includes("gif")) return "tweet_gif";
-  if (VIDEO_MIME_TYPES.has(mimeType) || mimeType.startsWith("video/")) {
-    return "tweet_video";
-  }
-  if (IMAGE_MIME_TYPES.has(mimeType) || mimeType.startsWith("image/")) {
-    return "tweet_image";
-  }
-  throw new Error(
-    `Unsupported media_type "${mimeType}". Use video/mp4, video/quicktime, image/jpeg, image/png, image/gif, or image/webp.`,
-  );
-}
-
-function stripDataUrlPrefix(base64: string): string {
-  const match = /^data:[^;]+;base64,(.+)$/s.exec(base64);
-  return match?.[1] ?? base64;
-}
-
-async function loadMediaBuffer(source: MediaSource): Promise<{
-  buffer: Buffer;
-  inferredMime?: string;
+  contentType?: string;
 }> {
-  if (source.kind === "base64") {
-    const raw = stripDataUrlPrefix(source.data).replace(/\s/g, "");
-    const buffer = Buffer.from(raw, "base64");
-    if (buffer.length === 0) {
-      throw new Error("media_base64 decoded to empty buffer");
-    }
-    if (buffer.length > MAX_MEDIA_BYTES) {
-      throw new Error(
-        `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
-      );
-    }
-    return { buffer };
-  }
-
-  if (source.kind === "path") {
-    const buffer = await readFile(source.path);
-    if (buffer.length > MAX_MEDIA_BYTES) {
-      throw new Error(
-        `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
-      );
-    }
-    return {
-      buffer,
-      inferredMime: inferMimeFromPathOrUrl(source.path),
-    };
-  }
-
-  // URL download
   let parsed: URL;
   try {
-    parsed = new URL(source.url);
+    parsed = new URL(url);
   } catch {
-    throw new Error(`Invalid media_url: ${source.url}`);
+    throw new Error(`Invalid media_url: ${url}`);
   }
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("media_url must be an http(s) URL");
   }
 
-  const response = await fetch(source.url, {
+  const response = await fetch(url, {
     redirect: "follow",
     headers: { Accept: "*/*" },
   });
@@ -335,32 +234,26 @@ async function loadMediaBuffer(source: MediaSource): Promise<{
   }
 
   const contentLength = Number(response.headers.get("content-length") ?? 0);
-  if (contentLength > MAX_MEDIA_BYTES) {
+  if (contentLength > MAX_VIDEO_BYTES) {
     throw new Error(
-      `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (Content-Length ${contentLength})`,
+      `Media exceeds max download size of ${MAX_VIDEO_BYTES} bytes (Content-Length ${contentLength})`,
     );
   }
 
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
+  const buffer = Buffer.from(await response.arrayBuffer());
   if (buffer.length === 0) {
     throw new Error("media_url downloaded empty body");
   }
-  if (buffer.length > MAX_MEDIA_BYTES) {
+  if (buffer.length > MAX_VIDEO_BYTES) {
     throw new Error(
-      `Media exceeds max size of ${MAX_MEDIA_BYTES} bytes (${buffer.length} bytes)`,
+      `Media exceeds max download size of ${MAX_VIDEO_BYTES} bytes (${buffer.length} bytes)`,
     );
   }
 
-  const headerMime = response.headers.get("content-type") ?? undefined;
-  const fromHeader =
-    headerMime && !isGenericContentType(headerMime)
-      ? normalizeMimeType(headerMime)
-      : undefined;
-  // Prefer path extension over generic blob Content-Types (Azure often sends application/octet-stream).
-  const inferredMime = fromHeader || inferMimeFromPathOrUrl(source.url);
-
-  return { buffer, inferredMime };
+  return {
+    buffer,
+    contentType: response.headers.get("content-type") ?? undefined,
+  };
 }
 
 function formatError(error: unknown): string {
@@ -513,30 +406,22 @@ export async function searchRecentTweets(params: {
 }
 
 /**
- * Upload media (image, GIF, or video) via X API v2 chunked upload.
+ * Download a URL and upload it via X API v2 chunked upload.
  * Requires OAuth 2.0 scope `media.write`. Videos are processed before returning.
  */
-export async function uploadMedia(params: {
-  source: MediaSource;
-  /** MIME type; inferred from path/URL/Content-Type when omitted */
-  mediaType?: string;
-  /** Defaults from media type (tweet_video / tweet_image / tweet_gif) */
-  mediaCategory?: MediaCategory;
-}): Promise<{
+export async function uploadMedia(mediaUrl: string): Promise<{
   media_id: string;
   media_type: string;
   media_category: MediaCategory;
   bytes: number;
 }> {
-  // Fail fast on missing token before downloading large media.
   getAccessToken();
 
   let buffer: Buffer;
-  let inferredMime: string | undefined;
+  let contentType: string | undefined;
   try {
-    ({ buffer, inferredMime } = await loadMediaBuffer(params.source));
+    ({ buffer, contentType } = await downloadMedia(mediaUrl));
   } catch (error) {
-    // Do not label download/IO failures as Twitter API errors (misleading for agents).
     if (
       error instanceof Error &&
       error.message.startsWith("Missing access token")
@@ -548,43 +433,11 @@ export async function uploadMedia(params: {
     );
   }
 
-  const detected = detectFormatFromMagic(buffer);
-  const mediaType = normalizeMimeType(
-    params.mediaType ?? inferredMime ?? detected.mime ?? "",
-  );
-  if (!mediaType) {
-    throw new Error(
-      "Could not determine media_type. Pass media_type explicitly (e.g. video/mp4).",
-    );
-  }
-
-  if (mediaType.startsWith("audio/")) {
-    throw new Error(
-      `Cannot upload audio (${mediaType}). X posts only accept images, GIF, or video — not bare audio. ` +
-        `Mux the audio into an MP4 video and upload with media_type=video/mp4.`,
-    );
-  }
-
-  let mediaCategory: MediaCategory;
-  try {
-    mediaCategory = params.mediaCategory ?? inferMediaCategory(mediaType);
-  } catch (error) {
-    throw error instanceof Error ? error : new Error(String(error));
-  }
-
-  const sourceHint =
-    params.source.kind === "url"
-      ? params.source.url.split("?")[0]
-      : params.source.kind === "path"
-        ? params.source.path
-        : undefined;
-
-  assertMediaCompatible({
+  const { mediaType, mediaCategory } = resolveMedia(
     buffer,
-    mediaType,
-    mediaCategory,
-    sourceHint,
-  });
+    mediaUrl,
+    contentType,
+  );
 
   return withTwitterError(async () => {
     try {
@@ -601,12 +454,9 @@ export async function uploadMedia(params: {
       };
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      // Library often surfaces "Media processing failed: undefined" with no detail.
       if (msg.includes("Media processing failed")) {
         throw new Error(
-          `${msg}. X rejected the file during async processing. ` +
-            `For video use H.264 MP4/MOV (not MP3/audio), duration 0.5–140s, max 512MB. ` +
-            `Detected local format: ${detected.label}.`,
+          `${msg}. X rejected the file during processing. ${SUPPORTED}. Video must be H.264 + AAC, ≥0.5s.`,
         );
       }
       throw error;

@@ -61,24 +61,28 @@ tweet.read tweet.write users.read follows.read follows.write media.write offline
 | `get_user_timeline` | User's recent posts |
 | `get_user_mentions` | Mentions timeline |
 | `search_recent_tweets` | Recent search (last 7 days) |
-| `upload_media` | Upload image / GIF / video (returns `media_id`) |
+| `upload_media` | Download a URL and upload image / GIF / video (returns `media_id`) |
 | `post_tweet` | Create a post (optional reply / quote / media) |
 | `delete_tweet` | Delete own post |
 | `like_tweet` / `unlike_tweet` | Like management |
 | `retweet` / `undo_retweet` | Retweet management |
 | `follow_user` / `unfollow_user` | Follow management |
 
-### Posting video
+### Posting media
 
-1. Call **`upload_media`** with one of:
-   - `media_url` — HTTP(S) URL (preferred for large files)
-   - `media_path` — path on the server host
-   - `media_base64` — base64 payload (JSON body limit 64 MB; prefer URL for big videos)
-2. Optionally set `media_type` to `video/mp4` or `video/quicktime` if it cannot be inferred.
-3. Wait for the tool to return `{ "media_id": "..." }` (videos are processed server-side before return).
-4. Call **`post_tweet`** with `media_ids: ["<media_id>"]` and optional `text`.
+1. Call **`upload_media`** with `media_url` (HTTP(S) URL). Type and category are detected from the file.
+2. Wait for `{ "media_id": "..." }` (videos are processed before return).
+3. Call **`post_tweet`** with `media_ids: ["<media_id>"]` and optional `text`.
 
-Limits: **1 video or 1 GIF**, or **up to 4 images** per post. Max file size loaded in-process: **512 MB**.
+X post media ([official limits](https://docs.x.com/x-api/media/quickstart/best-practices)):
+
+| Kind | Formats | Size | Per post |
+|------|---------|------|----------|
+| Image | JPEG, PNG, WEBP | 5 MB each | up to 4 |
+| GIF | GIF | 15 MB (≤1280×1080, ≤350 frames) | 1 |
+| Video | H.264 MP4 or MOV, AAC audio | 0.5 s–20 min (125 min Premium); this server loads up to 512 MB | 1 |
+
+Do not mix types. Audio (MP3 / WAV / M4A) is not supported — mux it into an MP4 first.
 
 ## Local development
 
