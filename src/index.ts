@@ -7,8 +7,7 @@ const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "0.0.0.0";
 
 const app = express();
-// Raised for base64 media in upload_media tool arguments; prefer media_url for large videos.
-app.use(express.json({ limit: "64mb" }));
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/health", (_req, res) => {
   res.status(200).json({
